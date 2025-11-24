@@ -7,6 +7,7 @@ import time
 import shutil
 from pathlib import Path
 import pyarrow.parquet as pq
+import gc  # Import Garbage Collector
 
 # --- Configuration ---
 st.set_page_config(
@@ -128,12 +129,19 @@ def convert_parquet_to_hyper(uploaded_file):
                     progress_bar.progress(current_progress)
                     status_text.text(f"Processing row {rows_processed} of {total_rows} total rows")
                     
-                    # Explicitly free memory
+                    # Explicitly free memory for this chunk
                     del df_chunk
                     del rows
+                    # Force GC periodically (every ~100k rows) or just rely on the final sweep.
+                    # Given the constraints, we rely on the final sweep to keep speed up.
         
         # Cleanup input file
         os.remove(parquet_path)
+        
+        # --- CRITICAL MEMORY FIX ---
+        # Force garbage collection to release all memory from the processing step
+        # before we attempt to load the file for download.
+        gc.collect()
         
         return hyper_path
 
@@ -202,13 +210,21 @@ def main():
         if 'converted_file_path' in st.session_state:
             file_path = st.session_state['converted_file_path']
             if os.path.exists(file_path):
-                with open(file_path, "rb") as file:
-                    st.download_button(
-                        label="Download .hyper File",
-                        data=file,
-                        file_name=os.path.basename(file_path),
-                        mime="application/octet-stream"
-                    )
+                
+                # --- CRITICAL MEMORY FIX ---
+                # Force GC again before the download button loads the file
+                gc.collect()
+                
+                try:
+                    with open(file_path, "rb") as file:
+                        st.download_button(
+                            label="Download .hyper File",
+                            data=file,
+                            file_name=os.path.basename(file_path),
+                            mime="application/octet-stream"
+                        )
+                except Exception as e:
+                    st.error(f"File too large to download in this environment: {str(e)}")
 
 if __name__ == "__main__":
     main()
