@@ -7,7 +7,8 @@ import time
 import shutil
 from pathlib import Path
 import pyarrow.parquet as pq
-import gc  # Import Garbage Collector
+import pyarrow as pa # Import PyArrow for memory management
+import gc
 
 # --- Configuration ---
 st.set_page_config(
@@ -69,7 +70,6 @@ def convert_parquet_to_hyper(uploaded_file):
     
     try:
         # 1. Save uploaded file to disk
-        # We still need the file on disk to stream it, but this doesn't load it into RAM
         with open(parquet_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
             
@@ -92,20 +92,14 @@ def convert_parquet_to_hyper(uploaded_file):
                 rows_processed = 0
                 
                 # 4. Iterate over batches (Chunking)
-                # This prevents loading the whole file into RAM
                 for batch in pq_file.iter_batches(batch_size=BATCH_SIZE):
                     
-                    # Check Timeout
                     if time.time() - start_time > TIMEOUT_SECONDS:
                         raise TimeoutError("Processing timeout exceeded (600 seconds).")
                     
-                    # Convert PyArrow batch to Pandas
                     df_chunk = batch.to_pandas()
-                    
-                    # Clean Data
                     df_chunk = clean_data(df_chunk)
                     
-                    # Create Table Definition (Only on first chunk)
                     if table_def is None:
                         table_name = TableName("Extract", "Extract")
                         columns = []
@@ -117,30 +111,30 @@ def convert_parquet_to_hyper(uploaded_file):
                         connection.catalog.create_schema(schema=table_name.schema_name)
                         connection.catalog.create_table(table_definition=table_def)
                     
-                    # Insert Data
                     with Inserter(connection, table_def) as inserter:
                         rows = df_chunk.values.tolist()
                         inserter.add_rows(rows)
                         inserter.execute()
                     
-                    # Update Progress
                     rows_processed += len(df_chunk)
                     current_progress = min(rows_processed / total_rows, 1.0)
                     progress_bar.progress(current_progress)
                     status_text.text(f"Processing row {rows_processed} of {total_rows} total rows")
                     
-                    # Explicitly free memory for this chunk
+                    # Memory Cleanup per chunk
                     del df_chunk
                     del rows
-                    # Force GC periodically (every ~100k rows) or just rely on the final sweep.
-                    # Given the constraints, we rely on the final sweep to keep speed up.
+                    
+                    # Aggressive PyArrow cleanup
+                    if rows_processed % (BATCH_SIZE * 5) == 0:
+                        pa.default_memory_pool().release_unused()
+                        gc.collect()
         
         # Cleanup input file
         os.remove(parquet_path)
         
-        # --- CRITICAL MEMORY FIX ---
-        # Force garbage collection to release all memory from the processing step
-        # before we attempt to load the file for download.
+        # Final Memory Cleanup
+        pa.default_memory_pool().release_unused()
         gc.collect()
         
         return hyper_path
@@ -163,68 +157,78 @@ def convert_parquet_to_hyper(uploaded_file):
 def main():
     st.title("Parquet to Tableau Hyper Converter")
     st.markdown("""
-    Convert your `.parquet` files to Tableau `.hyper` format instantly.
-    
-    **Instructions:**
-    1. Upload a valid `.parquet` file (Max 1GB).
-    2. Wait for the processing to complete.
-    3. Download your converted file.
+    Convert your `.parquet` files to Tableau `.hyper` format.
     """)
     
     st.info("ℹ️ Numeric columns (int/float) will have NaNs and Inf replaced with 0. Mixed columns are treated as text.")
 
-    # --- File Upload Section ---
-    uploaded_file = st.file_uploader("Choose a Parquet file", type="parquet")
+    # Initialize Session State
+    if 'converted_file_path' not in st.session_state:
+        st.session_state['converted_file_path'] = None
 
-    if uploaded_file is not None:
-        # Check file size (in bytes)
-        file_size_mb = uploaded_file.size / (1024 * 1024)
+    # --- STATE 1: RESULT AVAILABLE (Download Mode) ---
+    # We show this ONLY if a file is converted. We do NOT show the file uploader here.
+    # This prevents the input file from being loaded into memory.
+    if st.session_state['converted_file_path'] and os.path.exists(st.session_state['converted_file_path']):
         
-        if file_size_mb > MAX_FILE_SIZE_MB:
-            st.error("File size too large, max 1 GB")
-            return
-
-        # Display File Stats
-        st.subheader("File Details")
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write(f"**Filename:** {uploaded_file.name}")
-        with col2:
-            st.write(f"**Size:** {file_size_mb:.2f} MB")
-
-        # --- Processing Section ---
-        if st.button("Convert to Hyper"):
-            # Clean previous runs in session state
-            if 'converted_file_path' in st.session_state:
-                del st.session_state['converted_file_path']
+        st.success("✅ Conversion Completed Successfully!")
+        st.markdown("Your file is ready. The upload form has been hidden to free up memory for the download.")
+        
+        file_path = st.session_state['converted_file_path']
+        file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        
+        st.write(f"**Output File Size:** {file_size_mb:.2f} MB")
+        
+        # Final GC before download load
+        gc.collect()
+        
+        with open(file_path, "rb") as file:
+            st.download_button(
+                label="⬇️ Download .hyper File",
+                data=file,
+                file_name=os.path.basename(file_path),
+                mime="application/octet-stream"
+            )
             
-            with st.spinner("Initializing conversion process..."):
-                result_path = convert_parquet_to_hyper(uploaded_file)
-            
-            if result_path:
-                st.session_state['converted_file_path'] = str(result_path)
-                st.success("Process completed successfully")
-                st.balloons()
+        st.markdown("---")
+        if st.button("🔄 Convert Another File"):
+            # Cleanup output file
+            try:
+                os.remove(file_path)
+            except:
+                pass
+            # Clear state and rerun to show uploader
+            st.session_state['converted_file_path'] = None
+            st.rerun()
 
-        # --- Download Section ---
-        if 'converted_file_path' in st.session_state:
-            file_path = st.session_state['converted_file_path']
-            if os.path.exists(file_path):
+    # --- STATE 2: UPLOAD MODE ---
+    else:
+        uploaded_file = st.file_uploader("Choose a Parquet file", type="parquet")
+
+        if uploaded_file is not None:
+            # Check file size
+            file_size_mb = uploaded_file.size / (1024 * 1024)
+            
+            if file_size_mb > MAX_FILE_SIZE_MB:
+                st.error("File size too large, max 1 GB")
+                return
+
+            st.subheader("File Details")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**Filename:** {uploaded_file.name}")
+            with col2:
+                st.write(f"**Size:** {file_size_mb:.2f} MB")
+
+            if st.button("Convert to Hyper"):
+                with st.spinner("Initializing conversion process..."):
+                    result_path = convert_parquet_to_hyper(uploaded_file)
                 
-                # --- CRITICAL MEMORY FIX ---
-                # Force GC again before the download button loads the file
-                gc.collect()
-                
-                try:
-                    with open(file_path, "rb") as file:
-                        st.download_button(
-                            label="Download .hyper File",
-                            data=file,
-                            file_name=os.path.basename(file_path),
-                            mime="application/octet-stream"
-                        )
-                except Exception as e:
-                    st.error(f"File too large to download in this environment: {str(e)}")
+                if result_path:
+                    # Save path to session state
+                    st.session_state['converted_file_path'] = str(result_path)
+                    # FORCE RERUN to clear 'uploaded_file' from memory/widget state
+                    st.rerun()
 
 if __name__ == "__main__":
     main()
