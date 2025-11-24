@@ -7,8 +7,9 @@ import time
 import shutil
 from pathlib import Path
 import pyarrow.parquet as pq
-import pyarrow as pa # Import PyArrow for memory management
+import pyarrow as pa
 import gc
+import zipfile
 
 # --- Configuration ---
 st.set_page_config(
@@ -49,6 +50,19 @@ def clean_data(df):
         df[numeric_cols] = df[numeric_cols].fillna(0)
     
     return df
+
+def compress_file(input_path):
+    """
+    Compresses the file to .zip to save space and enable downloading larger datasets
+    within Streamlit's memory limits. Returns path to zip file.
+    """
+    zip_path = str(input_path).replace('.hyper', '.zip')
+    
+    # Write to zip file in chunks to avoid memory spikes
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        zipf.write(input_path, arcname=os.path.basename(input_path))
+        
+    return zip_path
 
 def convert_parquet_to_hyper(uploaded_file):
     """
@@ -133,11 +147,18 @@ def convert_parquet_to_hyper(uploaded_file):
         # Cleanup input file
         os.remove(parquet_path)
         
+        # 5. Compress Result (New Step)
+        status_text.text("Compressing output file...")
+        zip_path = compress_file(hyper_path)
+        
+        # Delete the uncompressed hyper file to free disk/overhead
+        os.remove(hyper_path)
+        
         # Final Memory Cleanup
         pa.default_memory_pool().release_unused()
         gc.collect()
         
-        return hyper_path
+        return zip_path
 
     except MemoryError:
         st.error("Insufficient memory. Even with chunking, a row group might be too large.")
@@ -167,37 +188,33 @@ def main():
         st.session_state['converted_file_path'] = None
 
     # --- STATE 1: RESULT AVAILABLE (Download Mode) ---
-    # We show this ONLY if a file is converted. We do NOT show the file uploader here.
-    # This prevents the input file from being loaded into memory.
     if st.session_state['converted_file_path'] and os.path.exists(st.session_state['converted_file_path']):
         
-        st.success("✅ Conversion Completed Successfully!")
+        st.success("✅ Conversion & Compression Completed!")
         st.markdown("Your file is ready. The upload form has been hidden to free up memory for the download.")
         
         file_path = st.session_state['converted_file_path']
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
         
-        st.write(f"**Output File Size:** {file_size_mb:.2f} MB")
+        st.write(f"**Output ZIP Size:** {file_size_mb:.2f} MB")
         
         # Final GC before download load
         gc.collect()
         
         with open(file_path, "rb") as file:
             st.download_button(
-                label="⬇️ Download .hyper File",
+                label="⬇️ Download .zip File",
                 data=file,
                 file_name=os.path.basename(file_path),
-                mime="application/octet-stream"
+                mime="application/zip"
             )
             
         st.markdown("---")
         if st.button("🔄 Convert Another File"):
-            # Cleanup output file
             try:
                 os.remove(file_path)
             except:
                 pass
-            # Clear state and rerun to show uploader
             st.session_state['converted_file_path'] = None
             st.rerun()
 
@@ -225,9 +242,7 @@ def main():
                     result_path = convert_parquet_to_hyper(uploaded_file)
                 
                 if result_path:
-                    # Save path to session state
                     st.session_state['converted_file_path'] = str(result_path)
-                    # FORCE RERUN to clear 'uploaded_file' from memory/widget state
                     st.rerun()
 
 if __name__ == "__main__":
