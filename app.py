@@ -6,6 +6,7 @@ import os
 import time
 import shutil
 from pathlib import Path
+import pyarrow.parquet as pq
 
 # --- Configuration ---
 st.set_page_config(
@@ -16,6 +17,7 @@ st.set_page_config(
 
 MAX_FILE_SIZE_MB = 1024  # 1 GB
 TIMEOUT_SECONDS = 600
+BATCH_SIZE = 10000  # Number of rows to process at a time
 
 # --- Helper Functions ---
 
@@ -30,34 +32,29 @@ def get_hyper_type(dtype):
     elif pd.api.types.is_datetime64_any_dtype(dtype):
         return SqlType.timestamp()
     elif pd.api.types.is_timedelta64_dtype(dtype):
-        return SqlType.text() # Hyper handles intervals differently, text is safer for generic apps
+        return SqlType.text()
     else:
         return SqlType.text()
 
 def clean_data(df):
     """
     Cleans numeric data: NaNs and Inf -> 0.
-    Mixed types are treated as objects (text) by default in Pandas read.
     """
-    # Select numeric columns
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     
     if not numeric_cols.empty:
-        # Replace Inf/-Inf with 0
         df[numeric_cols] = df[numeric_cols].replace([np.inf, -np.inf], 0)
-        # Fill NaNs with 0
         df[numeric_cols] = df[numeric_cols].fillna(0)
     
     return df
 
 def convert_parquet_to_hyper(uploaded_file):
     """
-    Main processing logic.
-    Returns: Path to the generated .hyper file or None if failed.
+    Main processing logic using Chunking/Streaming to save memory.
     """
     start_time = time.time()
     
-    # Create a temporary directory for processing
+    # Create a temporary directory
     temp_dir = Path("temp_conversion")
     temp_dir.mkdir(exist_ok=True)
     
@@ -70,70 +67,70 @@ def convert_parquet_to_hyper(uploaded_file):
     status_text = st.empty()
     
     try:
-        # 1. Save uploaded file to disk temporarily
+        # 1. Save uploaded file to disk
+        # We still need the file on disk to stream it, but this doesn't load it into RAM
         with open(parquet_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
-        
-        # 2. Read Parquet File
-        status_text.text("Reading Parquet file...")
+            
+        # 2. Initialize Parquet Stream
+        status_text.text("Initializing Parquet stream...")
         try:
-            df = pd.read_parquet(parquet_path)
+            pq_file = pq.ParquetFile(parquet_path)
+            total_rows = pq_file.metadata.num_rows
         except Exception as e:
-            st.error("Unable to read parquet file. File may be corrupted.")
+            st.error("Unable to read parquet file structure. File may be corrupted.")
             raise e
 
-        # Check Memory/Timeout constraint logic implicitly via execution flow
-        if time.time() - start_time > TIMEOUT_SECONDS:
-            raise TimeoutError("Processing timeout exceeded.")
-
-        # 3. Clean Data
-        status_text.text("Cleaning numeric data...")
-        df = clean_data(df)
-        
-        # 4. Prepare Hyper Definition
+        # 3. Setup Hyper Process
         status_text.text("Initializing Hyper process...")
         
-        # Start Hyper Process
         with HyperProcess(telemetry=Telemetry.DO_NOT_SEND_USAGE_DATA_TO_TABLEAU) as hyper:
             with Connection(endpoint=hyper.endpoint, database=str(hyper_path), create_mode=CreateMode.CREATE_AND_REPLACE) as connection:
                 
-                # Define Table Schema based on DataFrame
-                table_name = TableName("Extract", "Extract")
-                columns = []
+                table_def = None
+                rows_processed = 0
                 
-                for col_name, dtype in df.dtypes.items():
-                    sql_type = get_hyper_type(dtype)
-                    columns.append(TableDefinition.Column(name=str(col_name), type=sql_type, nullability=NULLABLE))
-                
-                table_def = TableDefinition(table_name=table_name, columns=columns)
-                connection.catalog.create_schema(schema=table_name.schema_name)
-                connection.catalog.create_table(table_definition=table_def)
-                
-                # 5. Insert Data with Progress Tracking
-                total_rows = len(df)
-                chunk_size = 1000 # Update progress every 1000 rows
-                
-                with Inserter(connection, table_def) as inserter:
-                    for i in range(0, total_rows, chunk_size):
-                        # Check timeout inside loop
-                        if time.time() - start_time > TIMEOUT_SECONDS:
-                            raise TimeoutError("Processing timeout exceeded (600 seconds).")
-                        
-                        chunk = df.iloc[i : i + chunk_size]
-                        
-                        # Convert chunk to list of rows for Hyper Inserter
-                        # Note: We convert NaTs to None for datetime compatibility if needed, 
-                        # but clean_data handles numerics. Text defaults handle others.
-                        rows = chunk.values.tolist()
-                        
-                        inserter.add_rows(rows)
-                        
-                        # Update UI
-                        current_progress = min((i + chunk_size) / total_rows, 1.0)
-                        progress_bar.progress(current_progress)
-                        status_text.text(f"Processing row {min(i + chunk_size, total_rows)} of {total_rows} total rows")
+                # 4. Iterate over batches (Chunking)
+                # This prevents loading the whole file into RAM
+                for batch in pq_file.iter_batches(batch_size=BATCH_SIZE):
                     
-                    inserter.execute()
+                    # Check Timeout
+                    if time.time() - start_time > TIMEOUT_SECONDS:
+                        raise TimeoutError("Processing timeout exceeded (600 seconds).")
+                    
+                    # Convert PyArrow batch to Pandas
+                    df_chunk = batch.to_pandas()
+                    
+                    # Clean Data
+                    df_chunk = clean_data(df_chunk)
+                    
+                    # Create Table Definition (Only on first chunk)
+                    if table_def is None:
+                        table_name = TableName("Extract", "Extract")
+                        columns = []
+                        for col_name, dtype in df_chunk.dtypes.items():
+                            sql_type = get_hyper_type(dtype)
+                            columns.append(TableDefinition.Column(name=str(col_name), type=sql_type, nullability=NULLABLE))
+                        
+                        table_def = TableDefinition(table_name=table_name, columns=columns)
+                        connection.catalog.create_schema(schema=table_name.schema_name)
+                        connection.catalog.create_table(table_definition=table_def)
+                    
+                    # Insert Data
+                    with Inserter(connection, table_def) as inserter:
+                        rows = df_chunk.values.tolist()
+                        inserter.add_rows(rows)
+                        inserter.execute()
+                    
+                    # Update Progress
+                    rows_processed += len(df_chunk)
+                    current_progress = min(rows_processed / total_rows, 1.0)
+                    progress_bar.progress(current_progress)
+                    status_text.text(f"Processing row {rows_processed} of {total_rows} total rows")
+                    
+                    # Explicitly free memory
+                    del df_chunk
+                    del rows
         
         # Cleanup input file
         os.remove(parquet_path)
@@ -141,13 +138,12 @@ def convert_parquet_to_hyper(uploaded_file):
         return hyper_path
 
     except MemoryError:
-        st.error("Insufficient memory to process file. Try a smaller file.")
+        st.error("Insufficient memory. Even with chunking, a row group might be too large.")
         return None
     except TimeoutError as te:
         st.error(str(te))
         return None
     except Exception as e:
-        # General error catch
         if "Schema" in str(e):
              st.error("Schema processing failed. Check file structure.")
         else:
@@ -213,8 +209,6 @@ def main():
                         file_name=os.path.basename(file_path),
                         mime="application/octet-stream"
                     )
-            
-        # Retry logic is handled natively by Streamlit's UI flow (uploading a new file or clicking button again)
 
 if __name__ == "__main__":
     main()
